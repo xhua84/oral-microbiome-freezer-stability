@@ -1,0 +1,973 @@
+---
+title: "Oral Microbiome Freezer Stability Study: Manuscript End-to-End Tables and Figures"
+output:
+  html_document:
+    toc: false
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+geometry: margin=0.6in
+params:
+  run_icc_calculation: true
+  run_adnois: true
+  icc_iterations: 100
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+```
+
+## 1. Input Data
+
+This report starts from the analysis table and generated result files in the current working directory:
+
+```{r paths-and-inputs}
+if (!exists("params")) {
+  params <- list(run_icc_calculation = TRUE, run_adnois = TRUE, icc_iterations = 100L)
+}
+run_icc_calculation <- isTRUE(params$run_icc_calculation)
+run_adnois <- isTRUE(params$run_adnois)
+icc_iterations <- as.integer(params$icc_iterations)
+
+analysis_table_file <- "analysis_sample_table_304.csv"
+icc_buccal_file <- "result_ICC_Storage_Time_KingFisher_Buccal_Cells_-80C.txt"
+icc_saliva_file <- "result_ICC_Storage_Time_KingFisher_Saliva_-80C.txt"
+adonis2_file <- "result_adonis2.csv"
+
+distance_files <- c(
+  "Bray Curtis" = "distance_bray_curtis_study_235.txt",
+  "Jaccard" = "distance_jaccard_study_235.txt",
+  "Unweighted Unifrac" = "distance_unweighted_unifrac_study_235.txt",
+  "Generalized Unifrac" = "distance_generalized_unifrac_study_235.txt",
+  "Weighted Unifrac" = "distance_weighted_unifrac_study_235.txt"
+)
+
+input_files_table <- data.frame(
+  check.names = FALSE,
+  "Input file" = c(
+    analysis_table_file,
+    icc_buccal_file,
+    icc_saliva_file,
+    adonis2_file,
+    unname(distance_files)
+  ),
+  "Used for" = c(
+    "Analysis sample metadata, alpha diversity, PCoA coordinates, relative abundance, CLR values",
+    "Buccal cell ICC and 95% CI table/figures",
+    "Saliva ICC and 95% CI table/figures",
+    "PERMANOVA / Adonis2 table and barplot",
+    "Bray Curtis distance matrix",
+    "Jaccard distance matrix",
+    "Unweighted UniFrac distance matrix",
+    "Generalized UniFrac distance matrix",
+    "Weighted UniFrac distance matrix"
+  ),
+  "Required when" = c(
+    "Always",
+    "run_icc_calculation = FALSE",
+    "run_icc_calculation = FALSE",
+    "run_adnois = FALSE",
+    rep("run_adnois = TRUE", length(distance_files))
+  )
+)
+
+required_inputs <- analysis_table_file
+if (run_icc_calculation) {
+  required_inputs <- c(required_inputs)
+} else {
+  required_inputs <- c(required_inputs, icc_buccal_file, icc_saliva_file)
+}
+
+if (run_adnois) {
+  required_inputs <- c(required_inputs, distance_files)
+} else {
+  required_inputs <- c(required_inputs, adonis2_file)
+}
+
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0L) {
+  stop("Missing required input file(s): ", paste(missing_inputs, collapse = ", "))
+}
+```
+
+```{r libraries}
+library(dplyr)
+library(forcats)
+library(ggplot2)
+library(knitr)
+library(patchwork)
+library(tidyr)
+library(vegan)
+
+latex_escape <- function(x) {
+  x <- gsub("\\\\", "\\\\textbackslash{}", x)
+  x <- gsub("([#$%&_{}])", "\\\\\\1", x, perl = TRUE)
+  x <- gsub("~", "\\\\textasciitilde{}", x, fixed = TRUE)
+  x <- gsub("^", "\\\\textasciicircum{}", x, fixed = TRUE)
+  x
+}
+
+format_table <- function(x, caption, digits = 8, wide = FALSE, row_names = NA) {
+  if (knitr::is_latex_output()) {
+    kbl <- knitr::kable(
+      x,
+      format = "latex",
+      digits = digits,
+      booktabs = FALSE,
+      row.names = row_names,
+      format.args = list(scientific = FALSE)
+    )
+    table_body <- if (wide) {
+      paste0("\\resizebox{\\linewidth}{!}{%\n", kbl, "\n}")
+    } else {
+      kbl
+    }
+    font_size <- if (wide) "\\scriptsize" else "\\small"
+    knitr::asis_output(paste0(
+      "\\noindent\\textbf{", latex_escape(caption), "}\\par\\vspace{0.35em}\n",
+      "\\begingroup\n", font_size, "\n",
+      table_body,
+      "\n\\endgroup\\par\\vspace{0.8em}\n"
+    ))
+  } else {
+    knitr::kable(
+      x,
+      digits = digits,
+      caption = caption,
+      row.names = row_names,
+      format.args = list(scientific = FALSE)
+    )
+  }
+}
+```
+
+```{r input-files-table}
+format_table(
+  input_files_table,
+  caption = "Input files used by the report.",
+  wide = TRUE,
+  row_names = FALSE
+)
+```
+
+The table below records the sample counts and run settings used by this report.
+
+```{r load-analysis-table}
+analysis_table <- read.csv(
+  analysis_table_file,
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  na.strings = "NA"
+)
+
+metadata_cols <- c(
+  "Sample_ID",
+  "Sample_Type",
+  "Subject_ID",
+  "Total_Reads",
+  "Specimen_Storage_Time",
+  "DNA_Storage_Time",
+  "Extraction_Method",
+  "Source_Material",
+  "Specimen_Storage_Temp"
+)
+alpha_cols <- c("observed_features", "shannon_entropy", "pielou_evenness", "faith_pd")
+
+missing_cols <- setdiff(c(metadata_cols, alpha_cols), colnames(analysis_table))
+if (length(missing_cols) > 0L) {
+  stop("Missing expected analysis table column(s): ", paste(missing_cols, collapse = ", "))
+}
+
+sample_type_order <- c(
+  "artificialcolony",
+  "ExtractionBlank",
+  "PCRNTCBlank",
+  "PCRWaterBlank",
+  "robogut",
+  "Study"
+)
+
+study_data <- analysis_table[analysis_table$Sample_Type == "Study", , drop = FALSE]
+study_data$Specimen_Storage_Time <- factor(
+  study_data$Specimen_Storage_Time,
+  levels = c("Baseline", "Month1", "Month12", "Year5")
+)
+
+masked_subject_order <- c(
+  "TV 0012", "TV 0026", "TV 0027", "TV 0024", "TV 0023",
+  "TV 0009", "TV 0025", "TV 0013", "TV 0005", "TV 0002",
+  "TV 0021", "TV 0010", "TV 0016", "TV 0022", "TV 0006",
+  "TV 0007", "TV 0018", "TV 0019", "TV 0017", "TV 0011",
+  "TV 0001", "TV 0028", "TV 0004", "TV 0030", "TV 0003",
+  "TV 0014", "TV 0029", "TV 0015", "TV 0020", "TV 0008"
+)
+if (all(masked_subject_order %in% study_data$Subject_ID) &&
+    length(unique(study_data$Subject_ID)) == length(masked_subject_order)) {
+  study_data$Subject_ID <- factor(study_data$Subject_ID, levels = masked_subject_order)
+} else {
+  study_data$Subject_ID <- factor(study_data$Subject_ID, levels = sort(unique(study_data$Subject_ID)))
+}
+study_data$Participant_ID <- sub("^TV[ _]+", "", study_data$Subject_ID)
+rownames(study_data) <- study_data$Sample_ID
+
+time_levels_raw <- c("Baseline", "Month1", "Month12", "Year5")
+time_levels_plot <- c("Baseline", "1 Month", "12 Months", "5 Years")
+time_labels <- stats::setNames(time_levels_plot, time_levels_raw)
+study_data$Specimen_Storage_Time_Plot <- factor(
+  time_labels[as.character(study_data$Specimen_Storage_Time)],
+  levels = time_levels_plot
+)
+
+outcome_vars <- setdiff(colnames(study_data), c(metadata_cols, "Participant_ID", "Specimen_Storage_Time_Plot"))
+
+stopifnot(nrow(analysis_table) == 304L)
+stopifnot(nrow(study_data) == 235L)
+
+input_summary <- data.frame(
+  Item = c(
+    "Total analysis samples",
+    "QC samples",
+    "Study samples",
+    "Run ICC calculation",
+    "Run Adonis2 calculation",
+    "ICC iterations"
+  ),
+  Value = c(
+    nrow(analysis_table),
+    sum(analysis_table$Sample_Type != "Study"),
+    nrow(study_data),
+    run_icc_calculation,
+    run_adnois,
+    icc_iterations
+  ),
+  check.names = FALSE
+)
+
+format_table(input_summary, caption = "Input data and run settings.")
+```
+
+```{r helper-functions}
+summary_stats <- function(x) {
+  x <- as.numeric(x)
+  x <- x[!is.na(x)]
+  if (length(x) == 0L) {
+    return(c(n = 0, min = NA, mean = NA, median = NA, max = NA, sd = NA, cv = NA))
+  }
+
+  x_mean <- mean(x)
+  x_sd <- if (length(x) > 1L) stats::sd(x) else NA_real_
+  c(
+    n = length(x),
+    min = min(x),
+    mean = x_mean,
+    median = stats::median(x),
+    max = max(x),
+    sd = x_sd,
+    cv = if (!is.na(x_sd) && x_mean != 0) x_sd / x_mean else NA_real_
+  )
+}
+
+summary_by_group <- function(dat, value_col, group_col, group_values, group_label) {
+  rows <- lapply(group_values, function(group_value) {
+    idx <- dat[[group_col]] == group_value
+    stats <- summary_stats(dat[[value_col]][idx])
+    data.frame(
+      check.names = FALSE,
+      Group = group_value,
+      t(stats)
+    )
+  })
+  out <- do.call(rbind, rows)
+  names(out)[1] <- group_label
+  out
+}
+
+alpha_summary_by_group <- function(dat, group_col, group_values, group_label) {
+  rows <- lapply(group_values, function(group_value) {
+    idx <- dat[[group_col]] == group_value
+    group_dat <- dat[idx, , drop = FALSE]
+    metric_summary <- unlist(lapply(alpha_cols, function(metric) {
+      stats <- summary_stats(group_dat[[metric]])
+      c(mean = stats[["mean"]], sd = stats[["sd"]], cv = stats[["cv"]])
+    }))
+    names(metric_summary) <- as.vector(t(outer(alpha_cols, c("mean", "sd", "cv"), paste, sep = "_")))
+
+    data.frame(
+      check.names = FALSE,
+      Group = group_value,
+      N_after_rarefaction_20000 = sum(!is.na(group_dat$observed_features)),
+      t(metric_summary)
+    )
+  })
+
+  out <- do.call(rbind, rows)
+  names(out)[1] <- group_label
+  out
+}
+```
+
+## 2. Reads Depth Summary Table
+
+The read-depth summary uses the 69 QC samples before rarefaction and the 235 study samples after rarefaction, exactly as represented in the analysis table.
+
+```{r read-depth-summary-table}
+read_depth_summary <- summary_by_group(
+  analysis_table,
+  value_col = "Total_Reads",
+  group_col = "Sample_Type",
+  group_values = sample_type_order,
+  group_label = "Sample_Type"
+)
+
+format_table(
+  read_depth_summary,
+  digits = 8,
+  caption = "Read-depth summary for QC samples before rarefaction and study samples after rarefaction."
+)
+```
+
+## 3. Alpha Diversity Summary Table
+
+The alpha-diversity summary reports observed ASVs, Shannon Index, Pielou's evenness, and Faith's phylogenetic diversity.
+
+```{r alpha-diversity-summary-table}
+artificial_subject_order <- sort(unique(analysis_table$Subject_ID[analysis_table$Sample_Type == "artificialcolony"]))
+
+alpha_summary_sample_type <- alpha_summary_by_group(
+  analysis_table,
+  group_col = "Sample_Type",
+  group_values = sample_type_order,
+  group_label = "Sample_Type"
+)
+
+alpha_summary_artificialcolony <- alpha_summary_by_group(
+  analysis_table[analysis_table$Sample_Type == "artificialcolony", , drop = FALSE],
+  group_col = "Subject_ID",
+  group_values = artificial_subject_order,
+  group_label = "Subject_ID"
+)
+
+format_table(alpha_summary_sample_type, digits = 8, caption = "Alpha diversity summary by sample type.", wide = TRUE)
+format_table(alpha_summary_artificialcolony, digits = 8, caption = "Alpha diversity summary for artificial colony samples by subject ID.", wide = TRUE)
+```
+
+## 4. Supplemental Figure 1
+
+Supplemental Figure 1 shows the first two PCoA axes for the five beta-diversity distances among analysis samples.
+
+```{r supplemental-figure-1}
+pcoa_rows <- analysis_table[!is.na(analysis_table$bray_curtis_PC1), , drop = FALSE]
+
+sample_type_colors <- c(
+  artificialcolony = "red",
+  ExtractionBlank = "blue",
+  robogut = "green",
+  Study = grDevices::rgb(0.7, 0.7, 0.7, 0.5)
+)
+point_colors <- unname(sample_type_colors[pcoa_rows$Sample_Type])
+point_colors[is.na(point_colors)] <- "black"
+
+point_pch <- rep(20, nrow(pcoa_rows))
+point_pch[pcoa_rows$Subject_ID == "D6300"] <- 1
+point_pch[pcoa_rows$Subject_ID == "D6310"] <- 2
+point_pch[pcoa_rows$Subject_ID == "D6331"] <- 3
+point_pch[pcoa_rows$Subject_ID == "DZ35323"] <- 4
+point_pch[pcoa_rows$Subject_ID == "DZ35327"] <- 5
+point_pch[pcoa_rows$Subject_ID == "RSM0001"] <- 6
+
+legend_text <- c(
+  paste("Artificial community", c("DZ35316", "D6300", "D6310", "D6331", "DZ35323", "DZ35327", "RSM0001")),
+  "ExtractionBlank",
+  "robogut",
+  "Study"
+)
+legend_colors <- c(rep("red", 7), "blue", "green", grDevices::rgb(0.7, 0.7, 0.7, 0.5))
+legend_pch <- c(20, 1:6, 20, 20, 20)
+
+plot_pcoa <- function(prefix, main, legend_position) {
+  plot_data <- as.matrix(pcoa_rows[, paste0(prefix, c("_PC1", "_PC2"))])
+  colnames(plot_data) <- c("PC1", "PC2")
+  plot(plot_data, col = point_colors, pch = point_pch, main = main)
+  legend(legend_position, legend_text, col = legend_colors, pch = legend_pch, cex = 1.2)
+}
+
+draw_supplemental_figure_1 <- function() {
+  old_par <- par(mfrow = c(2, 3), cex.main = 3, cex.lab = 2, cex.axis = 2, mar = c(5, 5, 5, 1))
+  on.exit(par(old_par), add = TRUE)
+  plot_pcoa("bray_curtis", "Bray Curtis", "bottomleft")
+  plot_pcoa("jaccard", "Jaccard", "bottomright")
+  plot_pcoa("unweighted_unifrac", "Unweighted UniFrac", "bottomleft")
+  plot_pcoa("generalized_unifrac", "Generalized UniFrac", "topright")
+  plot_pcoa("weighted_unifrac", "Weighted UniFrac", "topright")
+}
+
+pdf("Supplemental Figure 1.pdf", width = 22.5, height = 15)
+draw_supplemental_figure_1()
+invisible(dev.off())
+
+png("Supplemental Figure 1.png", width = 6750, height = 4500, res = 300)
+draw_supplemental_figure_1()
+invisible(dev.off())
+
+knitr::include_graphics("Supplemental Figure 1.png")
+```
+
+**Supplemental Figure 1:** Principal coordinates analysis plots of the study samples and quality controls for the 5 beta diversity metrics. The points are colored by type to indicate whether it is a study sample or quality control. For the quality controls, the artificial communities are further identified by shape to indicate the different communities.
+
+## 5. Relative Abundance Table
+
+This table lists the 14 selected genera with average relative abundance at least 0.01 in either buccal or saliva samples.
+
+```{r relative-abundance-table}
+selected_genera_order <- c(
+  "Prevotella",
+  "Streptococcus",
+  "Haemophilus",
+  "Veillonella",
+  "Neisseria",
+  "Alloprevotella",
+  "Rothia",
+  "Fusobacterium",
+  "Gemella",
+  "Leptotrichia",
+  "Granulicatella",
+  "Actinomyces",
+  "Porphyromonas",
+  "Megasphaera"
+)
+
+selected_ra_cols <- paste0("RA_", selected_genera_order)
+missing_ra_cols <- setdiff(selected_ra_cols, colnames(study_data))
+if (length(missing_ra_cols) > 0L) {
+  stop("Missing selected genus RA column(s): ", paste(missing_ra_cols, collapse = ", "))
+}
+
+buccal_data <- study_data[study_data$Source_Material == "Buccal Cells", , drop = FALSE]
+saliva_data <- study_data[study_data$Source_Material == "Saliva", , drop = FALSE]
+
+average_ra_table <- data.frame(
+  check.names = FALSE,
+  Genus = selected_genera_order,
+  Buccal_and_Saliva = vapply(selected_ra_cols, function(col) mean(study_data[[col]], na.rm = TRUE), numeric(1)),
+  Buccal = vapply(selected_ra_cols, function(col) mean(buccal_data[[col]], na.rm = TRUE), numeric(1)),
+  Saliva = vapply(selected_ra_cols, function(col) mean(saliva_data[[col]], na.rm = TRUE), numeric(1))
+)
+colnames(average_ra_table) <- c(
+  "Genus",
+  sprintf("Buccal and Saliva (n = %d)", nrow(study_data)),
+  sprintf("Buccal (n = %d)", nrow(buccal_data)),
+  sprintf("Saliva (n = %d)", nrow(saliva_data))
+)
+rownames(average_ra_table) <- NULL
+
+format_table(
+  average_ra_table,
+  digits = 10,
+  caption = "Selected genera average relative abundance.",
+  row_names = FALSE
+)
+```
+
+### 5.1 Figure 1
+
+Figure 1 summarizes mean genus-level relative abundance across specimen storage time and source material.
+
+```{r figure-1, fig.width=4, fig.height=5}
+ra_cols <- grep("^RA_", colnames(study_data), value = TRUE)
+ra_cols <- setdiff(ra_cols, grep("^RA_clr_", colnames(study_data), value = TRUE))
+taxa_include <- sub("^RA_", "", names(sort(colMeans(study_data[, ra_cols], na.rm = TRUE), decreasing = TRUE)))
+
+genus_colors <- c(
+  "#34b0b5", "#efb586", "#e3e863", "#acd84e", "#9edbef",
+  "#b7a6ea", "#5fbc21", "#b70600", "#a472d3", "#cdd321",
+  "#dc68f9", "#10b251", "#f0c6ff", "#2f32bf", "#ef2882"
+)
+names(genus_colors) <- c("Other", rev(taxa_include))
+
+ra_long_selected <- study_data %>%
+  dplyr::select(Sample_ID, Participant_ID, Source_Material, Specimen_Storage_Time_Plot, dplyr::all_of(ra_cols)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(ra_cols), names_to = "Genera", values_to = "RA") %>%
+  dplyr::mutate(Genera = sub("^RA_", "", Genera))
+
+ra_other <- study_data %>%
+  dplyr::select(Sample_ID, Participant_ID, Source_Material, Specimen_Storage_Time_Plot, dplyr::all_of(ra_cols)) %>%
+  dplyr::mutate(RA = pmax(0, 1 - rowSums(dplyr::across(dplyr::all_of(ra_cols)), na.rm = TRUE))) %>%
+  dplyr::transmute(Sample_ID, Participant_ID, Source_Material, Specimen_Storage_Time_Plot, Genera = "Other", RA)
+
+ra_long <- dplyr::bind_rows(ra_long_selected, ra_other) %>%
+  dplyr::mutate(
+    Genera = factor(Genera, levels = c("Other", rev(taxa_include))),
+    Participant_ID = factor(Participant_ID, levels = sort(unique(Participant_ID)))
+  )
+
+average_ra <- ra_long %>%
+  dplyr::group_by(Specimen_Storage_Time_Plot, Source_Material, Genera) %>%
+  dplyr::summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop")
+
+p_figure1 <- ggplot(average_ra, aes(x = Specimen_Storage_Time_Plot, y = mean_RA, fill = Genera)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+  facet_grid(~ Source_Material, scales = "free_x", space = "free") +
+  theme_bw() +
+  labs(x = "Timepoint", y = "Relative Abundance") +
+  scale_fill_manual(values = genus_colors, drop = FALSE) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, size = 10), legend.text = element_text(size = 8))
+
+png("Figure 1.png", width = 1200, height = 1500, res = 300)
+print(p_figure1)
+invisible(dev.off())
+
+p_figure1
+```
+
+**Figure 1:** Average genus-level relative abundance for DNA extracted at baseline, after 1 month, 12 months, and 5 years from collection of the 14 genera with at least a relative abundance of 0.01 (i.e., 1%) grouped by sample collection type (i.e., oral wash/buccal cells or saliva).
+
+### 5.2 Supplemental Figure 2
+
+Supplemental Figure 2 shows genus-level relative abundance by participant for buccal cells.
+
+```{r supplemental-figure-2, fig.width=12, fig.height=4.3}
+make_ra_by_participant_plot <- function(dat, axis_text_size) {
+  ggplot(dat, aes(x = Specimen_Storage_Time_Plot, y = RA, fill = Genera)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.85) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 1)) +
+    facet_grid(~ Participant_ID, scales = "free_x", space = "free") +
+    theme_bw() +
+    labs(x = "Participant ID", y = "Relative Abundance") +
+    scale_fill_manual(values = genus_colors, drop = FALSE) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.3, size = axis_text_size), legend.text = element_text(size = 8))
+}
+
+p_supplemental2 <- make_ra_by_participant_plot(
+  ra_long[ra_long$Source_Material == "Buccal Cells", , drop = FALSE],
+  axis_text_size = 8
+)
+
+png("Supplemental Figure 2.png", width = 7000, height = 2500, res = 300)
+print(p_supplemental2)
+invisible(dev.off())
+
+p_supplemental2
+```
+
+**Supplemental Figure 2:** Genus-level relative abundances from oral wash samples of the 14 most common genera grouped by participant ID at four timepoints (baseline, one month, 12 months, and 5 years).
+
+### 5.3 Supplemental Figure 3
+
+Supplemental Figure 3 shows genus-level relative abundance by participant for saliva.
+
+```{r supplemental-figure-3, fig.width=12, fig.height=4.3}
+p_supplemental3 <- make_ra_by_participant_plot(
+  ra_long[ra_long$Source_Material == "Saliva", , drop = FALSE],
+  axis_text_size = 10
+)
+
+png("Supplemental Figure 3.png", width = 7000, height = 2500, res = 300)
+print(p_supplemental3)
+invisible(dev.off())
+
+p_supplemental3
+```
+
+**Supplemental Figure 3:** Genus-level relative abundances from saliva samples of the 14 most common genera grouped by participant ID at four timepoints (baseline, one month, 12 months, and 5 years).
+
+## 6. PERMANOVA / Adonis2 Analysis and Figure 2
+
+The PERMANOVA / Adonis2 analysis is regenerated when `run_adnois` is `TRUE`. When the flag is `FALSE`, this section reads the copied Adonis2 result table.
+
+```{r adonis2-analysis-and-figure, fig.width=6.67, fig.height=6.67}
+if (run_adnois) {
+  data_model <- study_data[, c("Source_Material", "Specimen_Storage_Time", "Subject_ID"), drop = FALSE]
+  data_model$Source_Material <- factor(data_model$Source_Material)
+  data_model$Specimen_Storage_Time <- factor(data_model$Specimen_Storage_Time, levels = c("Baseline", "Month1", "Month12", "Year5"))
+  data_model$Subject_ID <- factor(data_model$Subject_ID, levels = levels(study_data$Subject_ID))
+
+  adonis_results <- lapply(names(distance_files), function(distance_name) {
+    dist_mat <- as.matrix(read.table(
+      distance_files[[distance_name]],
+      sep = "\t",
+      header = TRUE,
+      row.names = 1,
+      check.names = FALSE
+    ))
+    storage.mode(dist_mat) <- "numeric"
+    dist_mat <- dist_mat[rownames(data_model), rownames(data_model), drop = FALSE]
+
+    vegan::adonis2(
+      dist_mat ~ Source_Material + Specimen_Storage_Time + Subject_ID,
+      data = data_model,
+      by = "terms"
+    )
+  })
+  names(adonis_results) <- names(distance_files)
+
+  adonis2_r2 <- do.call(cbind, lapply(adonis_results, function(x) x$R2[1:4]))
+  rownames(adonis2_r2) <- c("Source Material", "Specimen Storage Time", "Subject", "Residual")
+  colnames(adonis2_r2) <- names(distance_files)
+  write.csv(adonis2_r2, file = adonis2_file, quote = FALSE)
+} else {
+  message("Adonis2 calculation skipped; reading copied Adonis2 result table.")
+  adonis2_r2 <- read.csv(adonis2_file, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+format_table(adonis2_r2, digits = 9, caption = "PERMANOVA / Adonis2 R2 summary.")
+
+adonis2_long <- data.frame(
+  Term = rep(rownames(adonis2_r2), ncol(adonis2_r2)),
+  Distance = rep(colnames(adonis2_r2), each = nrow(adonis2_r2)),
+  R2 = as.vector(as.matrix(adonis2_r2)),
+  check.names = FALSE
+)
+adonis2_long$Term <- factor(adonis2_long$Term, levels = c("Residual", "Subject", "Source Material", "Specimen Storage Time"))
+adonis2_long$Distance <- factor(
+  adonis2_long$Distance,
+  levels = c("Bray Curtis", "Jaccard", "Unweighted Unifrac", "Generalized Unifrac", "Weighted Unifrac")
+)
+
+p_adonis2 <- ggplot(adonis2_long, aes(x = Distance, y = R2, fill = Term)) +
+  geom_col(width = 0.8) +
+  scale_y_continuous(limits = c(0, 1.01), breaks = seq(0, 1, 0.2), labels = scales::percent) +
+  labs(x = "Beta diversity", y = expression("Explained variance (R"^2*")"), fill = NULL) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.major.x = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+
+png("Figure 2.png", width = 2000, height = 2000, res = 300)
+print(p_adonis2)
+invisible(dev.off())
+
+p_adonis2
+```
+
+**Figure 2:** Percent variability explained in beta diversity (i.e., Bray Curtis, Jaccard, unweighted Unifrac, generalized Unifrac, and weighted Unifrac) by specimen storage time (i.e., time in the freezer), source material (i.e., oral wash or saliva), and subject.
+
+## 7. ICC / 95% CI Calculation
+
+The ICC and 95% CI calculation is regenerated when `run_icc_calculation` is `TRUE`. When the flag is `FALSE`, this section reads the copied ICC txt files.
+
+```{r icc-calculation-and-table}
+comparison_labels <- c(Month1 = "1 Month", Month12 = "12 Months", Year5 = "5 Years")
+comparison_times <- names(comparison_labels)
+comparison_seed_index <- c(Month1 = 1L, Month12 = 4L, Year5 = 5L)
+icc_stats <- c(
+  "ICC_adjusted",
+  "ICC_adjusted_CI_lower",
+  "ICC_adjusted_CI_upper",
+  "ICC_unadjusted",
+  "ICC_unadjusted_CI_lower",
+  "ICC_unadjusted_CI_upper"
+)
+icc_wide_cols <- as.vector(t(outer(unname(comparison_labels), c("ICC", "LL", "UL"), paste, sep = "_")))
+
+read_icc_wide <- function(path) {
+  out <- read.table(path, sep = "\t", row.names = 1, check.names = FALSE, header = FALSE, na.strings = "NA")
+  if (ncol(out) != length(icc_wide_cols)) {
+    stop("Expected ", length(icc_wide_cols), " ICC columns in ", path, ", found ", ncol(out), ".")
+  }
+  colnames(out) <- icc_wide_cols
+  out
+}
+
+make_long_icc <- function(wide, source_material) {
+  wide <- tibble::rownames_to_column(as.data.frame(wide, check.names = FALSE), "Outcome")
+  wide %>%
+    tidyr::pivot_longer(!Outcome, names_to = "Timepoint", values_to = "Value") %>%
+    dplyr::mutate(
+      Specimen_Storage_Time_Comparison = sub("_.*", "", Timepoint),
+      Statistic = sub(".*_", "", Timepoint)
+    ) %>%
+    tidyr::pivot_wider(
+      id_cols = c(Outcome, Specimen_Storage_Time_Comparison),
+      names_from = Statistic,
+      values_from = Value
+    ) %>%
+    dplyr::rename(
+      ICC_adjusted = ICC,
+      ICC_adjusted_CI_lower = LL,
+      ICC_adjusted_CI_upper = UL
+    ) %>%
+    dplyr::mutate(Source_Material = source_material) %>%
+    dplyr::select(Source_Material, Outcome, Specimen_Storage_Time_Comparison, dplyr::everything())
+}
+
+if (run_icc_calculation) {
+  library(lme4)
+  library(performance)
+
+  calc_icc <- function(dat, outcome) {
+    dat <- dat[!is.na(dat[[outcome]]), , drop = FALSE]
+    if (nrow(dat) == 0L || length(unique(dat$Specimen_Storage_Time)) < 2L) {
+      return(rep(NA_real_, length(icc_stats)))
+    }
+
+    model <- try(
+      lme4::lmer(
+        stats::as.formula(paste0(outcome, " ~ Specimen_Storage_Time + (1 | Subject_ID)")),
+        data = dat
+      ),
+      silent = TRUE
+    )
+    if (inherits(model, "try-error")) {
+      return(rep(NA_real_, length(icc_stats)))
+    }
+
+    variance_components <- lme4::VarCorr(model)
+    sigma_between <- attr(variance_components$Subject_ID, "stddev")
+    sigma_error <- attr(variance_components, "sc")
+    fallback_icc <- sigma_between^2 / (sigma_between^2 + sigma_error^2)
+
+    icc_result <- try(
+      performance::icc(model, tolerance = 1e-7, ci = TRUE, iterations = icc_iterations),
+      silent = TRUE
+    )
+    out <- rep(NA_real_, length(icc_stats))
+    names(out) <- icc_stats
+
+    if (inherits(icc_result, "try-error") || any(is.na(icc_result))) {
+      out["ICC_adjusted"] <- fallback_icc
+      return(out)
+    }
+
+    out[] <- c(icc_result$ICC_adjusted, icc_result$ICC_unadjusted)
+    out
+  }
+
+  run_source_icc <- function(source_material) {
+    source_data <- study_data[study_data$Source_Material == source_material, , drop = FALSE]
+    source_data$Subject_ID <- droplevels(source_data$Subject_ID)
+    icc_array <- array(
+      NA_real_,
+      dim = c(length(outcome_vars), length(comparison_times), length(icc_stats)),
+      dimnames = list(outcome_vars, comparison_times, icc_stats)
+    )
+
+    for (j in seq_along(comparison_times)) {
+      comparison <- comparison_times[[j]]
+      comparison_data <- source_data[source_data$Specimen_Storage_Time %in% c("Baseline", comparison), , drop = FALSE]
+      comparison_data$Specimen_Storage_Time <- droplevels(comparison_data$Specimen_Storage_Time)
+      comparison_data$Subject_ID <- droplevels(comparison_data$Subject_ID)
+
+      for (i in seq_along(outcome_vars)) {
+        set.seed(unname(comparison_seed_index[comparison]) * 10000 + i)
+        icc_array[i, j, ] <- calc_icc(comparison_data, outcome_vars[[i]])
+      }
+    }
+
+    matrix(
+      aperm(icc_array[, , 1:3, drop = FALSE], c(1, 3, 2)),
+      nrow = dim(icc_array)[1],
+      ncol = length(comparison_times) * 3,
+      dimnames = list(outcome_vars, icc_wide_cols)
+    )
+  }
+
+  wide_buccal <- run_source_icc("Buccal Cells")
+  wide_saliva <- run_source_icc("Saliva")
+
+  write.table(wide_buccal, file = icc_buccal_file, sep = "\t", quote = FALSE, row.names = TRUE, col.names = FALSE, na = "NA")
+  write.table(wide_saliva, file = icc_saliva_file, sep = "\t", quote = FALSE, row.names = TRUE, col.names = FALSE, na = "NA")
+} else {
+  message("ICC calculation skipped; reading copied ICC txt files.")
+}
+
+wide_buccal <- read_icc_wide(icc_buccal_file)
+wide_saliva <- read_icc_wide(icc_saliva_file)
+
+long_icc <- dplyr::bind_rows(
+  make_long_icc(wide_buccal, "Buccal Cells"),
+  make_long_icc(wide_saliva, "Saliva")
+)
+
+write.csv(long_icc, file = "result_ICC_Storage_Time_long.csv", row.names = FALSE, quote = FALSE, na = "NA")
+
+format_table(wide_buccal, digits = 8, caption = "Buccal cell ICC and 95% CI summary.", wide = TRUE)
+format_table(wide_saliva, digits = 8, caption = "Saliva ICC and 95% CI summary.", wide = TRUE)
+```
+
+### 7.1 Figure 3
+
+Figure 3 shows ICC estimates and 95% CIs for alpha- and beta-diversity metrics.
+
+```{r figure-3, fig.width=10.67, fig.height=4.67}
+pretty_alpha_beta <- c(
+  "Observed ASVs",
+  "Shannon Index",
+  "Pielou's evenness",
+  "Faith's phylogenetic diversity",
+  "Bray Curtis (PC1)",
+  "Bray Curtis (PC2)",
+  "Jaccard (PC1)",
+  "Jaccard (PC2)",
+  "Unweighted Unifrac (PC1)",
+  "Unweighted Unifrac (PC2)",
+  "Generalized Unifrac (PC1)",
+  "Generalized Unifrac (PC2)",
+  "Weighted Unifrac (PC1)",
+  "Weighted Unifrac (PC2)"
+)
+
+rename_icc_rows <- function(x) {
+  rownames(x)[seq_along(pretty_alpha_beta)] <- pretty_alpha_beta
+  rownames(x)[15:28] <- sub("^RA_", "", rownames(x)[15:28])
+  tibble::rownames_to_column(as.data.frame(x, check.names = FALSE), "Index")
+}
+
+make_icc_plot_data <- function(wide_data, row_index, collection) {
+  wide_data[row_index, , drop = FALSE] %>%
+    tidyr::pivot_longer(!Index, names_to = "Timepoint", values_to = "ICC") %>%
+    dplyr::mutate(
+      Time = sub("_.*", "", Timepoint),
+      Timepoint = sub(".*_", "", Timepoint)
+    ) %>%
+    tidyr::pivot_wider(names_from = Timepoint, values_from = ICC) %>%
+    dplyr::mutate(Collection = collection)
+}
+
+icc_buccal_wide <- rename_icc_rows(wide_buccal)
+icc_saliva_wide <- rename_icc_rows(wide_saliva)
+
+data_plot_alpha_beta <- dplyr::bind_rows(
+  make_icc_plot_data(icc_buccal_wide, 1:14, "Buccal Cells"),
+  make_icc_plot_data(icc_saliva_wide, 1:14, "Saliva")
+)
+
+p_figure3 <- ggplot(
+  data = data_plot_alpha_beta,
+  aes(x = forcats::fct_inorder(Index), y = ICC, ymin = LL, ymax = UL, colour = Collection)
+) +
+  geom_pointrange(position = position_dodge(width = 0.6), aes(shape = Time)) +
+  scale_color_grey() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1) +
+  xlab(label = "Alpha and Beta Diversity Metrics") +
+  guides(color = guide_legend(title = "Collection Type"))
+
+png("Figure 3.png", width = 3200, height = 1400, res = 300)
+print(p_figure3)
+invisible(dev.off())
+
+p_figure3
+```
+
+**Figure 3:** Interclass correlation coefficients and 95% confidence intervals for alpha and beta diversity metrics from oral wash/buccal cells and saliva samples with DNA extraction at 1 month, 12 months, and 5 years compared to the baseline DNA extraction. ICC = interclass correlation coefficient; ASV = amplicon sequence variant; PC = principal coordinate analysis vector.
+
+### 7.2 Figure 4
+
+Figure 4 shows ICC estimates and 95% CIs for the selected genera.
+
+```{r figure-4, fig.width=10.67, fig.height=4.67}
+data_plot_taxa <- dplyr::bind_rows(
+  make_icc_plot_data(icc_buccal_wide, 15:28, "Buccal Cells"),
+  make_icc_plot_data(icc_saliva_wide, 15:28, "Saliva")
+)
+
+p_figure4 <- ggplot(
+  data = data_plot_taxa,
+  aes(x = forcats::fct_inorder(Index), y = ICC, ymin = LL, ymax = UL, colour = Collection)
+) +
+  geom_pointrange(position = position_dodge(width = 0.6), aes(shape = Time)) +
+  scale_color_grey() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1) +
+  xlab(label = "Genera") +
+  guides(color = guide_legend(title = "Collection Type"))
+
+png("Figure 4.png", width = 3200, height = 1400, res = 300)
+print(p_figure4)
+invisible(dev.off())
+
+p_figure4
+```
+
+**Figure 4:** Interclass correlation coefficients and 95% confidence intervals for genus-level relative abundances from oral wash/buccal cells and saliva samples with DNA extraction at 1 month, 12 months, and 5 years compared to the baseline DNA extraction. The genera presented represent the 14 taxa that met the average relative abundance criteria of greater than 0.01 (i.e., 1%). ICC = interclass correlation coefficient
+
+## 8. Supplemental Figure 4
+
+Supplemental Figure 4 shows each participant's alpha-diversity trajectory across storage time, with the mean trajectory overlaid in red.
+
+```{r alpha-vs-time-by-subject, fig.width=12, fig.height=6}
+alpha_plot_data <- study_data %>%
+  dplyr::select(
+    Participant_ID,
+    Source_Material,
+    Specimen_Storage_Time_Plot,
+    observed_features,
+    shannon_entropy,
+    pielou_evenness,
+    faith_pd
+  )
+
+make_alpha_subject_plot <- function(dat, y_col, y_label, title = NULL) {
+  ggplot(dat, aes(x = Specimen_Storage_Time_Plot, y = .data[[y_col]], group = Participant_ID)) +
+    geom_line(color = "grey50", alpha = 0.5, linewidth = 0.7) +
+    geom_point(color = "grey30", size = 2) +
+    stat_summary(aes(group = 1), fun = mean, geom = "line", color = rgb(1, 0, 0, 0.2), linewidth = 1.5) +
+    stat_summary(aes(group = 1), fun = mean, geom = "point", color = rgb(1, 0, 0, 0.2), size = 3) +
+    labs(title = title, x = "Specimen Storage Time", y = y_label)
+}
+
+buccal_alpha <- alpha_plot_data[alpha_plot_data$Source_Material == "Buccal Cells", , drop = FALSE]
+saliva_alpha <- alpha_plot_data[alpha_plot_data$Source_Material == "Saliva", , drop = FALSE]
+
+p_alpha_buccal_observed <- make_alpha_subject_plot(buccal_alpha, "observed_features", "Observed ASVs", "Buccal Cells") +
+  theme(plot.title = element_text(hjust = 0, size = 15, face = "bold", color = "black"))
+p_alpha_buccal_shannon <- make_alpha_subject_plot(buccal_alpha, "shannon_entropy", "Shannon Index")
+p_alpha_buccal_pielou <- make_alpha_subject_plot(buccal_alpha, "pielou_evenness", "Pielou's evenness")
+p_alpha_buccal_faith <- make_alpha_subject_plot(buccal_alpha, "faith_pd", "Faith's phylogenetic diversity")
+
+p_alpha_saliva_observed <- make_alpha_subject_plot(saliva_alpha, "observed_features", "Observed ASVs", "Saliva") +
+  theme(plot.title = element_text(hjust = 0, size = 15, face = "bold", color = "black"))
+p_alpha_saliva_shannon <- make_alpha_subject_plot(saliva_alpha, "shannon_entropy", "Shannon Index")
+p_alpha_saliva_pielou <- make_alpha_subject_plot(saliva_alpha, "pielou_evenness", "Pielou's evenness")
+p_alpha_saliva_faith <- make_alpha_subject_plot(saliva_alpha, "faith_pd", "Faith's phylogenetic diversity")
+
+p_alpha_vs_time <- (
+  p_alpha_buccal_observed | p_alpha_buccal_shannon | p_alpha_buccal_pielou | p_alpha_buccal_faith
+) / (
+  p_alpha_saliva_observed | p_alpha_saliva_shannon | p_alpha_saliva_pielou | p_alpha_saliva_faith
+)
+
+png("Supplemental Figure 4.png", width = 5000, height = 2500, res = 300)
+print(p_alpha_vs_time)
+invisible(dev.off())
+
+p_alpha_vs_time
+```
+
+**Supplemental Figure 4:** Individual trends in alpha diversity estimated from oral wash/buccal cell samples and saliva samples extracted at four timepoints (baseline, one month, 12 months, and 5 years). ASV = amplicon sequence variant.
+
+## Generated Output Files
+
+The table below lists the files generated by this one-file workflow.
+
+```{r generated-output-summary}
+generated_outputs <- c(
+  "Supplemental Figure 1.pdf",
+  "Supplemental Figure 1.png",
+  "Figure 1.png",
+  "Supplemental Figure 2.png",
+  "Supplemental Figure 3.png",
+  "result_adonis2.csv",
+  "Figure 2.png",
+  "result_ICC_Storage_Time_long.csv",
+  "Figure 3.png",
+  "Figure 4.png",
+  "Supplemental Figure 4.png"
+)
+
+output_summary <- data.frame(
+  File = basename(generated_outputs),
+  Exists = file.exists(generated_outputs),
+  Bytes = file.info(generated_outputs)$size,
+  check.names = FALSE
+)
+
+format_table(output_summary, caption = "Generated files from the one-file workflow.")
+```
